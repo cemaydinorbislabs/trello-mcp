@@ -1,0 +1,1828 @@
+import { BaseTool, ToolResult } from './base-tool.js';
+import { trelloClient } from '../trello/index.js';
+
+export class GetListCardsTool extends BaseTool {
+  readonly name = 'get_list_cards';
+  readonly description = 'Belirli bir listedeki kartları getir';
+  readonly inputSchema = {
+    type: 'object',
+    properties: {
+      listId: {
+        type: 'string',
+        description: 'Liste ID\'si',
+      },
+      includeArchived: {
+        type: 'boolean',
+        description: 'Arşivlenmiş kartları da dahil et (varsayılan: false)',
+        default: false,
+      },
+      limit: {
+        type: 'number',
+        description: 'Maksimum kart sayısı (varsayılan: 20)',
+        default: 20,
+      },
+    },
+    required: ['listId'],
+  };
+
+  async execute(args: any): Promise<ToolResult> {
+    try {
+      this.validateRequired(args, ['listId']);
+
+      const cards = await trelloClient.getListCards(args.listId);
+      
+      let filteredCards = cards;
+
+      // Filter by archived status
+      if (!args.includeArchived) {
+        filteredCards = filteredCards.filter(card => !card.closed);
+      }
+
+      // Apply limit
+      const limit = args.limit || 20;
+      const hasMore = filteredCards.length > limit;
+      filteredCards = filteredCards.slice(0, limit);
+
+      if (filteredCards.length === 0) {
+        return this.success('Bu listede hiç kart bulunamadı.');
+      }
+
+      const lines = [`📋 **Liste Kartları** (${filteredCards.length} adet${hasMore ? `, ${limit} tanesi gösteriliyor` : ''})`];
+      lines.push('');
+
+      for (let i = 0; i < filteredCards.length; i++) {
+        const card = filteredCards[i];
+        
+        // Kart başlığı
+        const cardNumber = i + 1;
+        const archivedIcon = card.closed ? '🗄️ ' : '';
+        lines.push(`${cardNumber}. ${archivedIcon}**${card.name}** (ID: ${card.id})`);
+        
+        // Temel bilgiler
+        if (card.desc && card.desc.trim()) {
+          lines.push(`   📝 ${this.truncateText(card.desc, 80)}`);
+        }
+        
+        if (card.due) {
+          const isOverdue = new Date(card.due) < new Date();
+          const dueIcon = card.dueComplete ? '✅' : (isOverdue ? '🔴' : '⏰');
+          lines.push(`   ${dueIcon} Son tarih: ${this.formatDate(card.due)}`);
+        }
+        
+        if (card.labels && card.labels.length > 0) {
+          const labelNames = card.labels.map((label: any) => label.name || label.color).join(', ');
+          lines.push(`   🏷️ Etiketler: ${labelNames}`);
+        }
+        
+        if (card.members && card.members.length > 0) {
+          const memberNames = card.members.map((member: any) => member.fullName || member.username).join(', ');
+          lines.push(`   👥 Üyeler: ${memberNames}`);
+        }
+        
+        if (card.badges) {
+          if (card.badges.attachments > 0) {
+            lines.push(`   📎 ${card.badges.attachments} ek dosya`);
+          }
+          if (card.badges.comments > 0) {
+            lines.push(`   💬 ${card.badges.comments} yorum`);
+          }
+          if (card.badges.checkItems > 0) {
+            lines.push(`   ☑️ ${card.badges.checkItemsChecked}/${card.badges.checkItems} görev tamamlandı`);
+          }
+        }
+        
+        lines.push(''); // Kartlar arası boşluk
+      }
+
+      return this.success(lines.join('\n'));
+
+    } catch (error) {
+      return this.error(`Kartlar alınırken hata oluştu: ${error instanceof Error ? error.message : 'Bilinmeyen hata'}`);
+    }
+  }
+
+  /**
+   * Power-Up verilerini işle ve formatla
+   */
+  private processPowerUpData(card: any, boardCustomFields: any[]): string[] {
+    const powerUpData: string[] = [];
+
+    // Custom Fields işle
+    if (card.customFieldItems && card.customFieldItems.length > 0) {
+      for (const fieldItem of card.customFieldItems) {
+        const fieldDef = boardCustomFields.find(f => f.id === fieldItem.idCustomField);
+        if (fieldDef) {
+          const value = this.extractCustomFieldValue(fieldItem);
+          
+          // Story Points için özel kontrol
+          if (this.isStoryPointsField(fieldDef.name)) {
+            powerUpData.push(`🎯 **Story Points:** ${value}`);
+          } else if (this.isEpicField(fieldDef.name)) {
+            powerUpData.push(`📋 **Epic:** ${value}`);
+          } else if (this.isSprintField(fieldDef.name)) {
+            powerUpData.push(`🏃 **Sprint:** ${value}`);
+          } else {
+            powerUpData.push(`• ${fieldDef.name}: ${value}`);
+          }
+        }
+      }
+    }
+
+    // Plugin Data işle
+    if (card.pluginData && card.pluginData.length > 0) {
+      for (const plugin of card.pluginData) {
+        try {
+          const data = JSON.parse(plugin.value);
+          
+          // Scrum/Agile specific data
+          if (data.storyPoints || data.points || data.estimate || data.size) {
+            const storyPoints = data.storyPoints || data.points || data.estimate || data.size;
+            powerUpData.push(`🎯 **Story Points:** ${storyPoints}`);
+            
+            // Remaining hesaplama
+            const spent = data.spent || 0;
+            const remaining = storyPoints - spent;
+            if (remaining >= 0) {
+              powerUpData.push(`⏳ **Remaining:** ${remaining} (${storyPoints} - ${spent})`);
+            }
+          }
+          
+          if (data.spent !== undefined) {
+            powerUpData.push(`⏱️ **Spent:** ${data.spent}`);
+          }
+          
+          if (data.epic || data.sprint) {
+            if (data.epic) powerUpData.push(`📋 **Epic:** ${data.epic}`);
+            if (data.sprint) powerUpData.push(`🏃 **Sprint:** ${data.sprint}`);
+          }
+          
+          // Epic ve Sprint için daha geniş arama
+          const epicKeys = ['epicName', 'epicId', 'epicTitle'];
+          const sprintKeys = ['sprintName', 'sprintId', 'sprintTitle', 'iteration'];
+          
+          for (const key of epicKeys) {
+            if (data[key] && !data.epic) {
+              powerUpData.push(`📋 **Epic:** ${data[key]}`);
+              break;
+            }
+          }
+          
+          for (const key of sprintKeys) {
+            if (data[key] && !data.sprint) {
+              powerUpData.push(`🏃 **Sprint:** ${data[key]}`);
+              break;
+            }
+          }
+          
+        } catch (e) {
+          // Plugin data parse edilemezse atla
+        }
+      }
+    }
+
+    return powerUpData;
+  }
+
+  /**
+   * Custom Field değerini çıkar
+   */
+  private extractCustomFieldValue(fieldItem: any): string {
+    if (!fieldItem.value) return '';
+    
+    switch (fieldItem.value.type) {
+      case 'text':
+        return fieldItem.value.text || '';
+      case 'number':
+        return fieldItem.value.number?.toString() || '';
+      case 'checkbox':
+        return fieldItem.value.checked ? '✅' : '❌';
+      case 'list':
+        return fieldItem.value.idValue || '';
+      default:
+        return JSON.stringify(fieldItem.value);
+    }
+  }
+
+  /**
+   * Story Points field olup olmadığını kontrol et
+   */
+  private isStoryPointsField(name: string): boolean {
+    if (!name) return false;
+    const lowerName = name.toLowerCase();
+    return lowerName.includes('story point') || 
+           lowerName.includes('size') || 
+           lowerName.includes('estimate') ||
+           lowerName.includes('points');
+  }
+
+  /**
+   * Epic field olup olmadığını kontrol et
+   */
+  private isEpicField(name: string): boolean {
+    if (!name) return false;
+    return name.toLowerCase().includes('epic');
+  }
+
+  /**
+   * Sprint field olup olmadığını kontrol et
+   */
+  private isSprintField(name: string): boolean {
+    if (!name) return false;
+    const lowerName = name.toLowerCase();
+    return lowerName.includes('sprint') || lowerName.includes('iteration');
+  }
+}
+
+// Export all card tools
+export const cardTools = [
+  new GetListCardsTool(),
+  new GetCardTool(),
+  new CreateCardTool(),
+  new UpdateCardTool(),
+  new MoveCardTool(),
+  new DeleteCardTool(),
+  new ArchiveCardTool(),
+  new GetCardWithPowerUpsTool(),
+  new GetCardDetailedTool(),
+  new GetCardWithScrumDataTool(),
+  new GetListCardsWithPowerUpsTool(),
+];
+      case 'checkbox':
+        return fieldItem.value.checked ? '✅' : '❌';
+      case 'list':
+        return fieldItem.value.idValue || '';
+      default:
+        return JSON.stringify(fieldItem.value);
+    }
+  }
+
+  /**
+   * Story Points field olup olmadığını kontrol et
+   */
+  private isStoryPointsField(name: string): boolean {
+    if (!name) return false;
+    const lowerName = name.toLowerCase();
+    return lowerName.includes('story point') || 
+           lowerName.includes('size') || 
+           lowerName.includes('estimate') ||
+           lowerName.includes('points');
+  }
+
+  /**
+   * Epic field olup olmadığını kontrol et
+   */
+  private isEpicField(name: string): boolean {
+    if (!name) return false;
+    return name.toLowerCase().includes('epic');
+  }
+
+  /**
+   * Sprint field olup olmadığını kontrol et
+   */
+  private isSprintField(name: string): boolean {
+    if (!name) return false;
+    const lowerName = name.toLowerCase();
+    return lowerName.includes('sprint') || lowerName.includes('iteration');
+  }
+} from './base-tool.js';
+import { trelloClient } from '../trello/client.js';
+import { TrelloCard, CreateCardRequest, UpdateCardRequest } from '../trello/types.js';
+
+export class GetListCardsTool extends BaseTool {
+  readonly name = 'get_list_cards';
+  readonly description = 'Belirli bir listedeki kartları getir';
+  readonly inputSchema = {
+    type: 'object',
+    properties: {
+      listId: {
+        type: 'string',
+        description: 'Liste ID\'si',
+      },
+      includeArchived: {
+        type: 'boolean',
+        description: 'Arşivlenmiş kartları da dahil et (varsayılan: false)',
+        default: false,
+      },
+      limit: {
+        type: 'number',
+        description: 'Maksimum kart sayısı (varsayılan: 50)',
+        default: 50,
+      },
+    },
+    required: ['listId'],
+  };
+
+  async execute(args: any): Promise<ToolResult> {
+    try {
+      this.validateRequired(args, ['listId']);
+
+      const cards = await trelloClient.getListCards(args.listId);
+      
+      let filteredCards = cards;
+
+      // Filter by archived status
+      if (!args.includeArchived) {
+        filteredCards = filteredCards.filter(card => !card.closed);
+      }
+
+      // Apply limit
+      const limit = args.limit || 50;
+      const hasMore = filteredCards.length > limit;
+      filteredCards = filteredCards.slice(0, limit);
+
+      if (filteredCards.length === 0) {
+        return this.success('Bu listede hiç kart bulunamadı.');
+      }
+
+      const cardList = this.formatList(
+        filteredCards,
+        (card: TrelloCard) => {
+          const lines = [`🎯 **${card.name}** (ID: ${card.id})`];
+          
+          if (card.desc && card.desc.trim()) {
+            lines.push(`   📝 ${this.truncateText(card.desc, 80)}`);
+          }
+          
+          if (card.due) {
+            const isOverdue = new Date(card.due) < new Date();
+            const dueIcon = card.dueComplete ? '✅' : (isOverdue ? '🔴' : '⏰');
+            lines.push(`   ${dueIcon} Son tarih: ${this.formatDate(card.due)}`);
+          }
+          
+          if (card.labels && card.labels.length > 0) {
+            const labelNames = card.labels.map(label => label.name || label.color).join(', ');
+            lines.push(`   🏷️ Etiketler: ${labelNames}`);
+          }
+          
+          if (card.members && card.members.length > 0) {
+            const memberNames = card.members.map(member => member.fullName || member.username).join(', ');
+            lines.push(`   👥 Üyeler: ${memberNames}`);
+          }
+          
+          if (card.badges.attachments > 0) {
+            lines.push(`   📎 ${card.badges.attachments} ek dosya`);
+          }
+          
+          if (card.badges.comments > 0) {
+            lines.push(`   💬 ${card.badges.comments} yorum`);
+          }
+          
+          if (card.badges.checkItems > 0) {
+            lines.push(`   ☑️ ${card.badges.checkItemsChecked}/${card.badges.checkItems} görev tamamlandı`);
+          }
+          
+          if (card.closed) {
+            lines.push(`   🗄️ Arşivlenmiş`);
+          }
+          
+          return lines.join('\n');
+        },
+        `🎯 Kartlar (${filteredCards.length} adet${hasMore ? `, ${limit} tanesi gösteriliyor` : ''})`
+      );
+
+      return this.success(cardList);
+
+    } catch (error) {
+      return this.error(`Kartlar alınırken hata oluştu: ${error instanceof Error ? error.message : 'Bilinmeyen hata'}`);
+    }
+  }
+
+  /**
+   * Power-Up verilerini işle ve formatla
+   */
+  private processPowerUpData(card: any, boardCustomFields: any[]): string[] {
+    const powerUpData: string[] = [];
+
+    // Custom Fields işle
+    if (card.customFieldItems && card.customFieldItems.length > 0) {
+      for (const fieldItem of card.customFieldItems) {
+        const fieldDef = boardCustomFields.find(f => f.id === fieldItem.idCustomField);
+        if (fieldDef) {
+          const value = this.extractCustomFieldValue(fieldItem);
+          
+          // Story Points için özel kontrol
+          if (this.isStoryPointsField(fieldDef.name)) {
+            powerUpData.push(`🎯 **Story Points:** ${value}`);
+          } else if (this.isEpicField(fieldDef.name)) {
+            powerUpData.push(`📋 **Epic:** ${value}`);
+          } else if (this.isSprintField(fieldDef.name)) {
+            powerUpData.push(`🏃 **Sprint:** ${value}`);
+          } else {
+            powerUpData.push(`• ${fieldDef.name}: ${value}`);
+          }
+        }
+      }
+    }
+
+    // Plugin Data işle
+    if (card.pluginData && card.pluginData.length > 0) {
+      for (const plugin of card.pluginData) {
+        try {
+          const data = JSON.parse(plugin.value);
+          
+          // Scrum/Agile specific data
+          if (data.storyPoints || data.points || data.estimate || data.size) {
+            const storyPoints = data.storyPoints || data.points || data.estimate || data.size;
+            powerUpData.push(`🎯 **Story Points:** ${storyPoints}`);
+            
+            // Remaining hesaplama
+            const spent = data.spent || 0;
+            const remaining = storyPoints - spent;
+            if (remaining >= 0) {
+              powerUpData.push(`⏳ **Remaining:** ${remaining} (${storyPoints} - ${spent})`);
+            }
+          }
+          
+          if (data.spent !== undefined) {
+            powerUpData.push(`⏱️ **Spent:** ${data.spent}`);
+          }
+          
+          if (data.epic || data.sprint) {
+            if (data.epic) powerUpData.push(`📋 **Epic:** ${data.epic}`);
+            if (data.sprint) powerUpData.push(`🏃 **Sprint:** ${data.sprint}`);
+          }
+          
+          // Epic ve Sprint için daha geniş arama
+          const epicKeys = ['epicName', 'epicId', 'epicTitle'];
+          const sprintKeys = ['sprintName', 'sprintId', 'sprintTitle', 'iteration'];
+          
+          for (const key of epicKeys) {
+            if (data[key] && !data.epic) {
+              powerUpData.push(`📋 **Epic:** ${data[key]}`);
+              break;
+            }
+          }
+          
+          for (const key of sprintKeys) {
+            if (data[key] && !data.sprint) {
+              powerUpData.push(`🏃 **Sprint:** ${data[key]}`);
+              break;
+            }
+          }
+          
+        } catch (e) {
+          // Plugin data parse edilemezse atla
+        }
+      }
+    }
+
+    return powerUpData;
+  }
+
+  /**
+   * Custom Field değerini çıkar
+   */
+  private extractCustomFieldValue(fieldItem: any): string {
+    if (!fieldItem.value) return '';
+    
+    switch (fieldItem.value.type) {
+      case 'text':
+        return fieldItem.value.text || '';
+      case 'number':
+        return fieldItem.value.number?.toString() || '';
+      case 'date':
+        return fieldItem.value.date || '';
+      case 'checkbox':
+        return fieldItem.value.checked ? '✅' : '❌';
+      case 'list':
+        return fieldItem.value.idValue || '';
+      default:
+        return JSON.stringify(fieldItem.value);
+    }
+  }
+
+  /**
+   * Story Points field olup olmadığını kontrol et
+   */
+  private isStoryPointsField(name: string): boolean {
+    if (!name) return false;
+    const lowerName = name.toLowerCase();
+    return lowerName.includes('story point') || 
+           lowerName.includes('size') || 
+           lowerName.includes('estimate') ||
+           lowerName.includes('points');
+  }
+
+  /**
+   * Epic field olup olmadığını kontrol et
+   */
+  private isEpicField(name: string): boolean {
+    if (!name) return false;
+    return name.toLowerCase().includes('epic');
+  }
+
+  /**
+   * Sprint field olup olmadığını kontrol et
+   */
+  private isSprintField(name: string): boolean {
+    if (!name) return false;
+    const lowerName = name.toLowerCase();
+    return lowerName.includes('sprint') || lowerName.includes('iteration');
+  }
+}
+
+export class GetCardTool extends BaseTool {
+  readonly name = 'get_card';
+  readonly description = 'Belirli bir kartın detaylı bilgilerini al';
+  readonly inputSchema = {
+    type: 'object',
+    properties: {
+      cardId: {
+        type: 'string',
+        description: 'Kart ID\'si',
+      },
+    },
+    required: ['cardId'],
+  };
+
+  async execute(args: any): Promise<ToolResult> {
+    try {
+      this.validateRequired(args, ['cardId']);
+
+      const card = await trelloClient.getCard(args.cardId);
+
+      const cardInfo = [
+        `🎯 **${card.name}**`,
+        `ID: ${card.id}`,
+        `URL: ${card.shortUrl}`,
+        `Liste ID: ${card.idList}`,
+        `Pano ID: ${card.idBoard}`,
+        `Pozisyon: ${card.pos}`,
+        `Durum: ${card.closed ? '🗄️ Arşivlenmiş' : '✅ Aktif'}`,
+        `Son aktivite: ${this.formatDate(card.dateLastActivity)}`,
+        '',
+      ];
+
+      if (card.desc && card.desc.trim()) {
+        cardInfo.push('**Açıklama:**', card.desc, '');
+      }
+
+      if (card.due) {
+        const isOverdue = new Date(card.due) < new Date();
+        const dueStatus = card.dueComplete ? '✅ Tamamlandı' : (isOverdue ? '🔴 Gecikmiş' : '⏰ Bekliyor');
+        cardInfo.push(`**Son Tarih:** ${this.formatDate(card.due)} (${dueStatus})`, '');
+      }
+
+      if (card.labels && card.labels.length > 0) {
+        cardInfo.push('**Etiketler:**');
+        card.labels.forEach(label => {
+          cardInfo.push(`• ${label.name || 'İsimsiz'} (${label.color})`);
+        });
+        cardInfo.push('');
+      }
+
+      if (card.members && card.members.length > 0) {
+        cardInfo.push('**Üyeler:**');
+        card.members.forEach(member => {
+          cardInfo.push(`• ${member.fullName} (@${member.username})`);
+        });
+        cardInfo.push('');
+      }
+
+      if (card.badges.attachments > 0 || card.badges.comments > 0 || card.badges.checkItems > 0) {
+        cardInfo.push('**İstatistikler:**');
+        if (card.badges.attachments > 0) {
+          cardInfo.push(`📎 ${card.badges.attachments} ek dosya`);
+        }
+        if (card.badges.comments > 0) {
+          cardInfo.push(`💬 ${card.badges.comments} yorum`);
+        }
+        if (card.badges.checkItems > 0) {
+          cardInfo.push(`☑️ ${card.badges.checkItemsChecked}/${card.badges.checkItems} görev tamamlandı`);
+        }
+      }
+
+      return this.success(cardInfo.join('\n'));
+
+    } catch (error) {
+      return this.error(`Kart bilgileri alınırken hata oluştu: ${error instanceof Error ? error.message : 'Bilinmeyen hata'}`);
+    }
+  }
+}
+
+export class CreateCardTool extends BaseTool {
+  readonly name = 'create_card';
+  readonly description = 'Yeni bir kart oluştur';
+  readonly inputSchema = {
+    type: 'object',
+    properties: {
+      listId: {
+        type: 'string',
+        description: 'Kartın ekleneceği liste ID\'si',
+      },
+      name: {
+        type: 'string',
+        description: 'Kart adı',
+      },
+      description: {
+        type: 'string',
+        description: 'Kart açıklaması (isteğe bağlı)',
+      },
+      dueDate: {
+        type: 'string',
+        description: 'Son tarih (ISO 8601 formatında, örn: 2024-12-31T23:59:59Z)',
+      },
+      position: {
+        type: 'string',
+        description: 'Kart pozisyonu ("top", "bottom" veya sayısal değer)',
+        default: 'bottom',
+      },
+      memberIds: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Karta atanacak üye ID\'leri',
+      },
+      labelIds: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Karta eklenecek etiket ID\'leri',
+      },
+    },
+    required: ['listId', 'name'],
+  };
+
+  async execute(args: any): Promise<ToolResult> {
+    try {
+      this.validateRequired(args, ['listId', 'name']);
+
+      const createData: CreateCardRequest = {
+        name: args.name.trim(),
+        idList: args.listId,
+      };
+
+      if (args.description && args.description.trim()) {
+        createData.desc = args.description.trim();
+      }
+
+      if (args.dueDate) {
+        // Validate date format
+        const dueDate = new Date(args.dueDate);
+        if (isNaN(dueDate.getTime())) {
+          return this.error('Geçersiz tarih formatı. ISO 8601 formatında tarih girin (örn: 2024-12-31T23:59:59Z)');
+        }
+        createData.due = args.dueDate;
+      }
+
+      if (args.position) {
+        createData.pos = args.position;
+      }
+
+      if (args.memberIds && args.memberIds.length > 0) {
+        createData.idMembers = args.memberIds;
+      }
+
+      if (args.labelIds && args.labelIds.length > 0) {
+        createData.idLabels = args.labelIds;
+      }
+
+      const newCard = await trelloClient.createCard(createData);
+
+      const successMessage = [
+        `✅ Kart başarıyla oluşturuldu!`,
+        ``,
+        `🎯 **${newCard.name}**`,
+        `ID: ${newCard.id}`,
+        `URL: ${newCard.shortUrl}`,
+        `Liste ID: ${newCard.idList}`,
+        newCard.desc ? `Açıklama: ${this.truncateText(newCard.desc, 100)}` : '',
+        newCard.due ? `Son tarih: ${this.formatDate(newCard.due)}` : '',
+        `Pozisyon: ${newCard.pos}`,
+      ].filter(line => line !== '').join('\n');
+
+      return this.success(successMessage);
+
+    } catch (error) {
+      return this.error(`Kart oluşturulurken hata oluştu: ${error instanceof Error ? error.message : 'Bilinmeyen hata'}`);
+    }
+  }
+}
+
+export class UpdateCardTool extends BaseTool {
+  readonly name = 'update_card';
+  readonly description = 'Mevcut bir kartı güncelle';
+  readonly inputSchema = {
+    type: 'object',
+    properties: {
+      cardId: {
+        type: 'string',
+        description: 'Güncellenecek kart ID\'si',
+      },
+      name: {
+        type: 'string',
+        description: 'Yeni kart adı',
+      },
+      description: {
+        type: 'string',
+        description: 'Yeni açıklama',
+      },
+      dueDate: {
+        type: 'string',
+        description: 'Yeni son tarih (ISO 8601 formatında)',
+      },
+      dueComplete: {
+        type: 'boolean',
+        description: 'Son tarih tamamlanma durumu',
+      },
+      closed: {
+        type: 'boolean',
+        description: 'Kart arşivleme durumu',
+      },
+      position: {
+        type: 'string',
+        description: 'Yeni pozisyon',
+      },
+    },
+    required: ['cardId'],
+  };
+
+  async execute(args: any): Promise<ToolResult> {
+    try {
+      this.validateRequired(args, ['cardId']);
+
+      const currentCard = await trelloClient.getCard(args.cardId);
+      const updateData: UpdateCardRequest = {};
+      const changes: string[] = [];
+
+      if (args.name && args.name.trim() !== currentCard.name) {
+        updateData.name = args.name.trim();
+        changes.push(`Ad: "${currentCard.name}" → "${updateData.name}"`);
+      }
+
+      if (args.description !== undefined) {
+        const newDesc = args.description.trim();
+        if (newDesc !== currentCard.desc) {
+          updateData.desc = newDesc;
+          changes.push(`Açıklama güncellendi`);
+        }
+      }
+
+      if (args.dueDate !== undefined) {
+        if (args.dueDate === '') {
+          updateData.due = null as any;
+          changes.push(`Son tarih kaldırıldı`);
+        } else {
+          const dueDate = new Date(args.dueDate);
+          if (isNaN(dueDate.getTime())) {
+            return this.error('Geçersiz tarih formatı');
+          }
+          updateData.due = args.dueDate;
+          changes.push(`Son tarih: ${this.formatDate(args.dueDate)}`);
+        }
+      }
+
+      if (args.dueComplete !== undefined && args.dueComplete !== currentCard.dueComplete) {
+        updateData.dueComplete = args.dueComplete;
+        changes.push(`Son tarih durumu: ${args.dueComplete ? 'Tamamlandı' : 'Bekliyor'}`);
+      }
+
+      if (args.closed !== undefined && args.closed !== currentCard.closed) {
+        updateData.closed = args.closed;
+        changes.push(`Durum: ${args.closed ? 'Arşivlendi' : 'Aktif hale getirildi'}`);
+      }
+
+      if (args.position !== undefined) {
+        updateData.pos = args.position;
+        changes.push(`Pozisyon: ${currentCard.pos} → ${args.position}`);
+      }
+
+      if (changes.length === 0) {
+        return this.success('Hiç değişiklik yapılmadı.');
+      }
+
+      const updatedCard = await trelloClient.updateCard(args.cardId, updateData);
+
+      const successMessage = [
+        `✅ Kart başarıyla güncellendi!`,
+        ``,
+        `🎯 **${updatedCard.name}**`,
+        `ID: ${updatedCard.id}`,
+        ``,
+        `🔄 Değişiklikler:`,
+        ...changes.map(change => `• ${change}`),
+      ].join('\n');
+
+      return this.success(successMessage);
+
+    } catch (error) {
+      return this.error(`Kart güncellenirken hata oluştu: ${error instanceof Error ? error.message : 'Bilinmeyen hata'}`);
+    }
+  }
+}
+
+export class MoveCardTool extends BaseTool {
+  readonly name = 'move_card';
+  readonly description = 'Kartı başka bir listeye taşı';
+  readonly inputSchema = {
+    type: 'object',
+    properties: {
+      cardId: {
+        type: 'string',
+        description: 'Taşınacak kart ID\'si',
+      },
+      targetListId: {
+        type: 'string',
+        description: 'Hedef liste ID\'si',
+      },
+      position: {
+        type: 'string',
+        description: 'Hedef pozisyon ("top", "bottom" veya sayısal değer)',
+        default: 'bottom',
+      },
+    },
+    required: ['cardId', 'targetListId'],
+  };
+
+  async execute(args: any): Promise<ToolResult> {
+    try {
+      this.validateRequired(args, ['cardId', 'targetListId']);
+
+      const currentCard = await trelloClient.getCard(args.cardId);
+      const position = args.position || 'bottom';
+
+      const updatedCard = await trelloClient.moveCard(args.cardId, args.targetListId, position);
+
+      const successMessage = [
+        `✅ Kart başarıyla taşındı!`,
+        ``,
+        `🎯 **${updatedCard.name}**`,
+        `ID: ${updatedCard.id}`,
+        ``,
+        `📋 Eski liste: ${currentCard.idList}`,
+        `📋 Yeni liste: ${updatedCard.idList}`,
+        `📍 Yeni pozisyon: ${updatedCard.pos}`,
+      ].join('\n');
+
+      return this.success(successMessage);
+
+    } catch (error) {
+      return this.error(`Kart taşınırken hata oluştu: ${error instanceof Error ? error.message : 'Bilinmeyen hata'}`);
+    }
+  }
+}
+
+export class DeleteCardTool extends BaseTool {
+  readonly name = 'delete_card';
+  readonly description = 'Bir kartı kalıcı olarak sil';
+  readonly inputSchema = {
+    type: 'object',
+    properties: {
+      cardId: {
+        type: 'string',
+        description: 'Silinecek kart ID\'si',
+      },
+      confirm: {
+        type: 'boolean',
+        description: 'Silme işlemini onaylayın (güvenlik için gerekli)',
+        default: false,
+      },
+    },
+    required: ['cardId', 'confirm'],
+  };
+
+  async execute(args: any): Promise<ToolResult> {
+    try {
+      this.validateRequired(args, ['cardId']);
+
+      if (!args.confirm) {
+        return this.error('Kart silme işlemi için confirm: true parametresini eklemelisiniz. Bu işlem geri alınamaz!');
+      }
+
+      const card = await trelloClient.getCard(args.cardId);
+      
+      await trelloClient.deleteCard(args.cardId);
+
+      const successMessage = [
+        `🗑️ Kart kalıcı olarak silindi!`,
+        ``,
+        `Silinen kart: **${card.name}**`,
+        `ID: ${card.id}`,
+        ``,
+        `⚠️ Bu işlem geri alınamaz.`,
+      ].join('\n');
+
+      return this.success(successMessage);
+
+    } catch (error) {
+      return this.error(`Kart silinirken hata oluştu: ${error instanceof Error ? error.message : 'Bilinmeyen hata'}`);
+    }
+  }
+}
+
+export class ArchiveCardTool extends BaseTool {
+  readonly name = 'archive_card';
+  readonly description = 'Bir kartı arşivle veya arşivden çıkar';
+  readonly inputSchema = {
+    type: 'object',
+    properties: {
+      cardId: {
+        type: 'string',
+        description: 'Kart ID\'si',
+      },
+      archive: {
+        type: 'boolean',
+        description: 'true: arşivle, false: arşivden çıkar (varsayılan: true)',
+        default: true,
+      },
+    },
+    required: ['cardId'],
+  };
+
+  async execute(args: any): Promise<ToolResult> {
+    try {
+      this.validateRequired(args, ['cardId']);
+
+      const { cardId, archive = true } = args;
+      
+      const updatedCard = await trelloClient.updateCard(cardId, { closed: archive });
+      
+      const action = archive ? 'arşivlendi' : 'arşivden çıkarıldı';
+      return this.success(`Kart "${updatedCard.name}" başarıyla ${action}.`);
+    } catch (error) {
+      return this.error(`Kart arşivleme işlemi başarısız: ${error instanceof Error ? error.message : 'Bilinmeyen hata'}`);
+    }
+  }
+}
+
+export class GetCardWithPowerUpsTool extends BaseTool {
+  readonly name = 'get_card_with_powerups';
+  readonly description = 'Kartın detaylı bilgilerini Power-Up verileriyle birlikte al';
+  readonly inputSchema = {
+    type: 'object',
+    properties: {
+      cardId: {
+        type: 'string',
+        description: 'Kart ID\'si',
+      },
+    },
+    required: ['cardId'],
+  };
+
+  async execute(args: any): Promise<ToolResult> {
+    try {
+      this.validateRequired(args, ['cardId']);
+
+      const cardData = await trelloClient.getCardWithAllData(args.cardId);
+      
+      const lines = [`🎯 **${cardData.name}** (ID: ${cardData.id})`];
+      
+      if (cardData.desc && cardData.desc.trim()) {
+        lines.push(`   📝 ${this.truncateText(cardData.desc, 80)}`);
+      }
+      
+      if (cardData.due) {
+        const isOverdue = new Date(cardData.due) < new Date();
+        const dueIcon = cardData.dueComplete ? '✅' : (isOverdue ? '🔴' : '⏰');
+        lines.push(`   ${dueIcon} Son tarih: ${this.formatDate(cardData.due)}`);
+      }
+      
+      if (cardData.labels && cardData.labels.length > 0) {
+        const labelNames = cardData.labels.map(label => label.name || label.color).join(', ');
+        lines.push(`   🏷️ Etiketler: ${labelNames}`);
+      }
+      
+      if (cardData.members && cardData.members.length > 0) {
+        const memberNames = cardData.members.map(member => member.fullName || member.username).join(', ');
+        lines.push(`   👥 Üyeler: ${memberNames}`);
+      }
+      
+      if (cardData.badges.attachments > 0) {
+        lines.push(`   📎 ${cardData.badges.attachments} ek dosya`);
+      }
+      
+      if (cardData.badges.comments > 0) {
+        lines.push(`   💬 ${cardData.badges.comments} yorum`);
+      }
+      
+      if (cardData.badges.checkItems > 0) {
+        lines.push(`   ☑️ ${cardData.badges.checkItemsChecked}/${cardData.badges.checkItems} görev tamamlandı`);
+      }
+      
+      if (cardData.closed) {
+        lines.push(`   🗄️ Arşivlenmiş`);
+      }
+
+      // Power-Up verilerini ekle
+      lines.push(`\n🔌 **Power-Up Verileri:**`);
+      
+      // Custom Fields
+      if (cardData.customFields && cardData.customFields.length > 0) {
+        lines.push(`   📊 **Custom Fields:** ${cardData.customFields.length} adet`);
+        
+        if (cardData.customFieldItems && cardData.customFieldItems.length > 0) {
+          for (const field of cardData.customFields) {
+            const fieldItem = cardData.customFieldItems.find((item: any) => item.idCustomField === field.id);
+            if (fieldItem) {
+              let value = '';
+              if (fieldItem.value) {
+                switch (fieldItem.value.type) {
+                  case 'text':
+                    value = fieldItem.value.text || '';
+                    break;
+                  case 'number':
+                    value = fieldItem.value.number?.toString() || '';
+                    break;
+                  case 'date':
+                    value = fieldItem.value.date || '';
+                    break;
+                  case 'checkbox':
+                    value = fieldItem.value.checked ? '✅' : '❌';
+                    break;
+                  case 'list':
+                    value = fieldItem.value.idValue || '';
+                    break;
+                  default:
+                    value = JSON.stringify(fieldItem.value);
+                }
+              }
+              
+              // Story Points için özel kontrol
+              if (field.name && field.name.toLowerCase().includes('story point') || 
+                  field.name && field.name.toLowerCase().includes('size') ||
+                  field.name && field.name.toLowerCase().includes('estimate')) {
+                lines.push(`     🎯 **Story Points:** ${value}`);
+              } else if (field.name && field.name.toLowerCase().includes('epic')) {
+                lines.push(`     📋 **Epic:** ${value}`);
+              } else if (field.name && field.name.toLowerCase().includes('sprint')) {
+                lines.push(`     🏃 **Sprint:** ${value}`);
+              } else {
+                lines.push(`     • ${field.name}: ${value}`);
+              }
+            }
+          }
+        } else {
+          lines.push(`   📋 **Custom Field Items:** Değer yok`);
+        }
+      } else {
+        lines.push(`   📊 **Custom Fields:** Mevcut değil`);
+      }
+
+      // Plugin Data (Story Points vb.)
+      if (cardData.pluginData && cardData.pluginData.length > 0) {
+        lines.push(`   🎯 **Plugin Data:** ${cardData.pluginData.length} adet`);
+        
+        for (const plugin of cardData.pluginData) {
+          try {
+            const data = JSON.parse(plugin.value);
+            
+            // Scrum/Agile specific data
+            if (data.storyPoints || data.points || data.estimate || data.size) {
+              const storyPoints = data.storyPoints || data.points || data.estimate || data.size;
+              lines.push(`     🎯 **Story Points:** ${storyPoints}`);
+              
+              // Remaining hesaplama
+              const spent = data.spent || 0;
+              const remaining = storyPoints - spent;
+              if (remaining >= 0) {
+                lines.push(`     ⏳ **Remaining:** ${remaining} (${storyPoints} - ${spent})`);
+              }
+            }
+            
+            if (data.spent || data.remaining) {
+              lines.push(`     ⏱️ **Spent:** ${data.spent || 0}`);
+            }
+            
+            if (data.epic || data.sprint) {
+              lines.push(`     📋 **Epic:** ${data.epic || 'N/A'}`);
+              lines.push(`     🏃 **Sprint:** ${data.sprint || 'N/A'}`);
+            }
+            
+            // Epic ve Sprint için daha geniş arama
+            const epicKeys = ['epic', 'epicName', 'epicId', 'epicTitle'];
+            const sprintKeys = ['sprint', 'sprintName', 'sprintId', 'sprintTitle', 'iteration'];
+            
+            for (const key of epicKeys) {
+              if (data[key] && !data.epic) {
+                lines.push(`     📋 **Epic:** ${data[key]}`);
+                break;
+              }
+            }
+            
+            for (const key of sprintKeys) {
+              if (data[key] && !data.sprint) {
+                lines.push(`     🏃 **Sprint:** ${data[key]}`);
+                break;
+              }
+            }
+            
+            // Diğer plugin verileri
+            if (Object.keys(data).length > 0) {
+              for (const [key, value] of Object.entries(data)) {
+                if (!['storyPoints', 'points', 'estimate', 'size', 'spent', 'remaining', 'epic', 'sprint', 'epicName', 'epicId', 'epicTitle', 'sprintName', 'sprintId', 'sprintTitle', 'iteration'].includes(key)) {
+                  lines.push(`     • ${key}: ${value}`);
+                }
+              }
+            }
+          } catch (e) {
+            // Plugin data parse edilemezse raw data'yı göster
+            lines.push(`     • ${plugin.idPlugin}: ${plugin.value.substring(0, 100)}...`);
+          }
+        }
+      } else {
+        lines.push(`   🎯 **Plugin Data:** Mevcut değil`);
+      }
+      
+      return this.success(lines.join('\n'));
+
+    } catch (error) {
+      // Daha detaylı hata mesajı oluştur
+      let errorMessage = 'Bilinmeyen hata';
+      
+      if (error instanceof Error) {
+        errorMessage = error.message;
+        
+        // Eğer detaylı hata bilgisi varsa ekle
+        if ((error as any).endpoint) {
+          errorMessage += ` (Endpoint: ${(error as any).endpoint})`;
+        }
+        if ((error as any).method) {
+          errorMessage += ` (Method: ${(error as any).method})`;
+        }
+        if ((error as any).originalError) {
+          const originalError = (error as any).originalError;
+          if (originalError instanceof Error) {
+            errorMessage += ` (Original: ${originalError.message})`;
+          }
+        }
+      } else if (typeof error === 'string') {
+        errorMessage = error;
+      } else if (error && typeof error === 'object') {
+        errorMessage = JSON.stringify(error);
+      }
+      
+      return this.error(`Kart bilgileri alınırken hata oluştu: ${errorMessage}`);
+    }
+  }
+}
+
+export class GetCardDetailedTool extends BaseTool {
+  readonly name = 'get_card_detailed';
+  readonly description = 'Kartın detaylı bilgilerini al (Power-Up desteği ile)';
+  readonly inputSchema = {
+    type: 'object',
+    properties: {
+      cardId: {
+        type: 'string',
+        description: 'Kart ID\'si',
+      },
+    },
+    required: ['cardId'],
+  };
+
+  async execute(args: any): Promise<ToolResult> {
+    try {
+      this.validateRequired(args, ['cardId']);
+
+      // Önce normal kart bilgilerini al
+      const card = await trelloClient.getCard(args.cardId);
+      
+      const lines = [`🎯 **${card.name}** (ID: ${card.id})`];
+      
+      if (card.desc && card.desc.trim()) {
+        lines.push(`   📝 ${this.truncateText(card.desc, 80)}`);
+      }
+      
+      if (card.due) {
+        const isOverdue = new Date(card.due) < new Date();
+        const dueIcon = card.dueComplete ? '✅' : (isOverdue ? '🔴' : '⏰');
+        lines.push(`   ${dueIcon} Son tarih: ${this.formatDate(card.due)}`);
+      }
+      
+      if (card.labels && card.labels.length > 0) {
+        const labelNames = card.labels.map(label => label.name || label.color).join(', ');
+        lines.push(`   🏷️ Etiketler: ${labelNames}`);
+      }
+      
+      if (card.members && card.members.length > 0) {
+        const memberNames = card.members.map(member => member.fullName || member.username).join(', ');
+        lines.push(`   👥 Üyeler: ${memberNames}`);
+      }
+      
+      if (card.badges.attachments > 0) {
+        lines.push(`   📎 ${card.badges.attachments} ek dosya`);
+      }
+      
+      if (card.badges.comments > 0) {
+        lines.push(`   💬 ${card.badges.comments} yorum`);
+      }
+      
+      if (card.badges.checkItems > 0) {
+        lines.push(`   ☑️ ${card.badges.checkItemsChecked}/${card.badges.checkItems} görev tamamlandı`);
+      }
+      
+      if (card.closed) {
+        lines.push(`   🗄️ Arşivlenmiş`);
+      }
+
+      // Power-Up verilerini ayrı ayrı kontrol et
+      lines.push(`\n🔌 **Power-Up Kontrolü:**`);
+      
+      try {
+        const customFields = await trelloClient.getBoardCustomFields(card.idBoard);
+        if (customFields && customFields.length > 0) {
+          lines.push(`   📊 **Custom Fields:** ${customFields.length} adet mevcut`);
+          
+          // Custom field items'ları kontrol et
+          try {
+            const customFieldItems = await trelloClient.getCardCustomFields(args.cardId);
+            if (customFieldItems && customFieldItems.length > 0) {
+              lines.push(`   📋 **Custom Field Items:** ${customFieldItems.length} adet değer`);
+              
+              // Her custom field için değer göster
+              for (const field of customFields) {
+                const fieldItem = customFieldItems.find((item: any) => item.idCustomField === field.id);
+                if (fieldItem) {
+                  let value = '';
+                  if (fieldItem.value) {
+                    switch (fieldItem.value.type) {
+                      case 'text':
+                        value = fieldItem.value.text || '';
+                        break;
+                      case 'number':
+                        value = fieldItem.value.number?.toString() || '';
+                        break;
+                      case 'date':
+                        value = fieldItem.value.date || '';
+                        break;
+                      case 'checkbox':
+                        value = fieldItem.value.checked ? '✅' : '❌';
+                        break;
+                      case 'list':
+                        value = fieldItem.value.idValue || '';
+                        break;
+                      default:
+                        value = JSON.stringify(fieldItem.value);
+                    }
+                  }
+                  
+                  // Story Points için özel kontrol
+                  if (field.name && field.name.toLowerCase().includes('story point') || 
+                      field.name && field.name.toLowerCase().includes('size') ||
+                      field.name && field.name.toLowerCase().includes('estimate')) {
+                    lines.push(`     🎯 **Story Points:** ${value}`);
+                  } else if (field.name && field.name.toLowerCase().includes('epic')) {
+                    lines.push(`     📋 **Epic:** ${value}`);
+                  } else if (field.name && field.name.toLowerCase().includes('sprint')) {
+                    lines.push(`     🏃 **Sprint:** ${value}`);
+                  } else {
+                    lines.push(`     • ${field.name}: ${value}`);
+                  }
+                }
+              }
+            } else {
+              lines.push(`   📋 **Custom Field Items:** Değer yok`);
+            }
+          } catch (error) {
+            lines.push(`   📋 **Custom Field Items:** Erişim hatası`);
+          }
+        } else {
+          lines.push(`   📊 **Custom Fields:** Mevcut değil`);
+        }
+      } catch (error) {
+        lines.push(`   📊 **Custom Fields:** Erişim hatası`);
+      }
+
+      // Plugin Data kontrolü ekle
+      try {
+        const pluginData = await trelloClient.getCardPluginData(args.cardId);
+        if (pluginData && pluginData.length > 0) {
+          lines.push(`   🔌 **Plugin Data:** ${pluginData.length} adet mevcut`);
+          
+          for (const plugin of pluginData) {
+            try {
+              const data = JSON.parse(plugin.value);
+              
+              // Scrum/Agile specific data
+              if (data.storyPoints || data.points || data.estimate || data.size) {
+                const storyPoints = data.storyPoints || data.points || data.estimate || data.size;
+                lines.push(`     🎯 **Story Points:** ${storyPoints}`);
+                
+                // Remaining hesaplama
+                const spent = data.spent || 0;
+                const remaining = storyPoints - spent;
+                if (remaining >= 0) {
+                  lines.push(`     ⏳ **Remaining:** ${remaining} (${storyPoints} - ${spent})`);
+                }
+              }
+              
+              if (data.spent || data.remaining) {
+                lines.push(`     ⏱️ **Spent:** ${data.spent || 0}`);
+              }
+              
+              if (data.epic || data.sprint) {
+                lines.push(`     📋 **Epic:** ${data.epic || 'N/A'}`);
+                lines.push(`     🏃 **Sprint:** ${data.sprint || 'N/A'}`);
+              }
+              
+              // Epic ve Sprint için daha geniş arama
+              const epicKeys = ['epic', 'epicName', 'epicId', 'epicTitle'];
+              const sprintKeys = ['sprint', 'sprintName', 'sprintId', 'sprintTitle', 'iteration'];
+              
+              for (const key of epicKeys) {
+                if (data[key] && !data.epic) {
+                  lines.push(`     📋 **Epic:** ${data[key]}`);
+                  break;
+                }
+              }
+              
+              for (const key of sprintKeys) {
+                if (data[key] && !data.sprint) {
+                  lines.push(`     🏃 **Sprint:** ${data[key]}`);
+                  break;
+                }
+              }
+              
+              // Diğer plugin verileri
+              if (Object.keys(data).length > 0) {
+                for (const [key, value] of Object.entries(data)) {
+                  if (!['storyPoints', 'points', 'estimate', 'size', 'spent', 'remaining', 'epic', 'sprint', 'epicName', 'epicId', 'epicTitle', 'sprintName', 'sprintId', 'sprintTitle', 'iteration'].includes(key)) {
+                    lines.push(`     • ${key}: ${value}`);
+                  }
+                }
+              }
+            } catch (e) {
+              // Plugin data parse edilemezse raw data'yı göster
+              lines.push(`     • ${plugin.idPlugin}: ${plugin.value.substring(0, 100)}...`);
+            }
+          }
+        } else {
+          lines.push(`   🔌 **Plugin Data:** Mevcut değil`);
+        }
+      } catch (error) {
+        lines.push(`   🔌 **Plugin Data:** Erişim hatası`);
+      }
+      
+      return this.success(lines.join('\n'));
+
+    } catch (error) {
+      let errorMessage = 'Bilinmeyen hata';
+      
+      if (error instanceof Error) {
+        errorMessage = error.message;
+      } else if (typeof error === 'string') {
+        errorMessage = error;
+      } else if (error && typeof error === 'object') {
+        errorMessage = JSON.stringify(error);
+      }
+      
+      return this.error(`Kart bilgileri alınırken hata oluştu: ${errorMessage}`);
+    }
+  }
+}
+
+export class GetCardWithScrumDataTool extends BaseTool {
+  readonly name = 'get_card_with_scrum_data';
+  readonly description = 'Kartın Scrum/Agile Power-Up verilerini dahil detaylı bilgilerini al';
+  readonly inputSchema = {
+    type: 'object',
+    properties: {
+      cardId: {
+        type: 'string',
+        description: 'Kart ID\'si',
+      },
+    },
+    required: ['cardId'],
+  };
+
+  async execute(args: any): Promise<ToolResult> {
+    try {
+      this.validateRequired(args, ['cardId']);
+
+      // Tüm verileri al
+      const cardData = await trelloClient.getCardWithAllData(args.cardId);
+      
+      const lines = [`🎯 **${cardData.name}** (ID: ${cardData.id})`];
+      
+      if (cardData.desc && cardData.desc.trim()) {
+        lines.push(`   📝 ${this.truncateText(cardData.desc, 80)}`);
+      }
+      
+      if (cardData.due) {
+        const isOverdue = new Date(cardData.due) < new Date();
+        const dueIcon = cardData.dueComplete ? '✅' : (isOverdue ? '🔴' : '⏰');
+        lines.push(`   ${dueIcon} Son tarih: ${this.formatDate(cardData.due)}`);
+      }
+      
+      if (cardData.labels && cardData.labels.length > 0) {
+        const labelNames = cardData.labels.map(label => label.name || label.color).join(', ');
+        lines.push(`   🏷️ Etiketler: ${labelNames}`);
+      }
+      
+      if (cardData.members && cardData.members.length > 0) {
+        const memberNames = cardData.members.map(member => member.fullName || member.username).join(', ');
+        lines.push(`   👥 Üyeler: ${memberNames}`);
+      }
+      
+      if (cardData.badges.attachments > 0) {
+        lines.push(`   📎 ${cardData.badges.attachments} ek dosya`);
+      }
+      
+      if (cardData.badges.comments > 0) {
+        lines.push(`   💬 ${cardData.badges.comments} yorum`);
+      }
+      
+      if (cardData.badges.checkItems > 0) {
+        lines.push(`   ☑️ ${cardData.badges.checkItemsChecked}/${cardData.badges.checkItems} görev tamamlandı`);
+      }
+      
+      if (cardData.closed) {
+        lines.push(`   🗄️ Arşivlenmiş`);
+      }
+
+      // Debug bilgisi - tüm verileri göster
+      lines.push(`\n🔍 **DEBUG - Tüm Veriler:**`);
+      lines.push(`   📊 **Custom Fields:** ${cardData.customFields?.length || 0} adet`);
+      lines.push(`   📋 **Custom Field Items:** ${cardData.customFieldItems?.length || 0} adet`);
+      lines.push(`   🔌 **Plugin Data:** ${cardData.pluginData?.length || 0} adet`);
+      lines.push(`   📎 **Attachments:** ${cardData.attachments?.length || 0} adet`);
+      lines.push(`   📝 **Actions:** ${cardData.actions?.length || 0} adet`);
+      lines.push(`   🏷️ **Stickers:** ${cardData.stickers?.length || 0} adet`);
+      lines.push(`   ☑️ **Checklists:** ${cardData.checklists?.length || 0} adet`);
+      lines.push(`   🔌 **Board Plugins:** ${cardData.boardPlugins?.length || 0} adet`);
+
+      // Custom Fields detayları
+      if (cardData.customFields && cardData.customFields.length > 0) {
+        lines.push(`\n📊 **Custom Fields Detayları:**`);
+        for (const field of cardData.customFields) {
+          lines.push(`   • ${field.name} (${field.type}) - ID: ${field.id}`);
+        }
+      }
+
+      // Custom Field Items detayları
+      if (cardData.customFieldItems && cardData.customFieldItems.length > 0) {
+        lines.push(`\n📋 **Custom Field Items Detayları:**`);
+        for (const item of cardData.customFieldItems) {
+          lines.push(`   • Field ID: ${item.idCustomField}`);
+          lines.push(`     Value: ${JSON.stringify(item.value)}`);
+        }
+      }
+
+      // Plugin Data detayları
+      if (cardData.pluginData && cardData.pluginData.length > 0) {
+        lines.push(`\n🔌 **Plugin Data Detayları:**`);
+        for (const plugin of cardData.pluginData) {
+          lines.push(`   • Plugin ID: ${plugin.idPlugin}`);
+          lines.push(`     Value: ${plugin.value.substring(0, 200)}...`);
+        }
+      }
+
+      // Board Plugins detayları
+      if (cardData.boardPlugins && cardData.boardPlugins.length > 0) {
+        lines.push(`\n🔌 **Board Plugins Detayları:**`);
+        for (const plugin of cardData.boardPlugins) {
+          lines.push(`   • Plugin: ${plugin.name || plugin.id} - ${plugin.description || 'No description'}`);
+        }
+      }
+
+      // Stickers detayları
+      if (cardData.stickers && cardData.stickers.length > 0) {
+        lines.push(`\n🏷️ **Stickers Detayları:**`);
+        for (const sticker of cardData.stickers) {
+          lines.push(`   • ${sticker.name || sticker.id} - ${sticker.imageUrl || 'No image'}`);
+        }
+      }
+
+      // Checklists detayları
+      if (cardData.checklists && cardData.checklists.length > 0) {
+        lines.push(`\n☑️ **Checklists Detayları:**`);
+        for (const checklist of cardData.checklists) {
+          lines.push(`   • ${checklist.name} - ${checklist.checkItems?.length || 0} items`);
+          if (checklist.checkItems && checklist.checkItems.length > 0) {
+            for (const item of checklist.checkItems.slice(0, 3)) {
+              lines.push(`     - ${item.name} (${item.state})`);
+            }
+            if (checklist.checkItems.length > 3) {
+              lines.push(`     ... ve ${checklist.checkItems.length - 3} tane daha`);
+            }
+          }
+        }
+      }
+
+      // Actions detayları
+      if (cardData.actions && cardData.actions.length > 0) {
+        lines.push(`\n📝 **Actions Detayları (Son 5):**`);
+        for (const action of cardData.actions.slice(0, 5)) {
+          lines.push(`   • Type: ${action.type}`);
+          if (action.data) {
+            lines.push(`     Data: ${JSON.stringify(action.data).substring(0, 100)}...`);
+          }
+        }
+      }
+
+      // Scrum/Agile Power-Up verilerini parse et
+      lines.push(`\n🎯 **Scrum/Agile Power-Up Verileri:**`);
+      
+      // Custom Fields'dan Story Points ara
+      if (cardData.customFields && cardData.customFields.length > 0) {
+        lines.push(`   📊 **Custom Fields:** ${cardData.customFields.length} adet`);
+        
+        if (cardData.customFieldItems && cardData.customFieldItems.length > 0) {
+          lines.push(`   📋 **Custom Field Items:** ${cardData.customFieldItems.length} adet`);
+          
+          for (const field of cardData.customFields) {
+            const fieldItem = cardData.customFieldItems.find((item: any) => item.idCustomField === field.id);
+            if (fieldItem) {
+              let value = '';
+              if (fieldItem.value) {
+                switch (fieldItem.value.type) {
+                  case 'text':
+                    value = fieldItem.value.text || '';
+                    break;
+                  case 'number':
+                    value = fieldItem.value.number?.toString() || '';
+                    break;
+                  case 'date':
+                    value = fieldItem.value.date || '';
+                    break;
+                  case 'checkbox':
+                    value = fieldItem.value.checked ? '✅' : '❌';
+                    break;
+                  case 'list':
+                    value = fieldItem.value.idValue || '';
+                    break;
+                  default:
+                    value = JSON.stringify(fieldItem.value);
+                }
+              }
+              
+              // Story Points için özel kontrol
+              if (field.name && field.name.toLowerCase().includes('story point') || 
+                  field.name && field.name.toLowerCase().includes('size') ||
+                  field.name && field.name.toLowerCase().includes('estimate')) {
+                lines.push(`     🎯 **Story Points:** ${value}`);
+              } else if (field.name && field.name.toLowerCase().includes('epic')) {
+                lines.push(`     📋 **Epic:** ${value}`);
+              } else if (field.name && field.name.toLowerCase().includes('sprint')) {
+                lines.push(`     🏃 **Sprint:** ${value}`);
+              } else {
+                lines.push(`     • ${field.name}: ${value}`);
+              }
+            }
+          }
+        }
+      } else {
+        lines.push(`   📊 **Custom Fields:** Mevcut değil`);
+      }
+
+      // Plugin Data'dan Scrum verilerini ara
+      if (cardData.pluginData && cardData.pluginData.length > 0) {
+        lines.push(`   🔌 **Plugin Data:** ${cardData.pluginData.length} adet`);
+        
+        for (const plugin of cardData.pluginData) {
+          try {
+            const data = JSON.parse(plugin.value);
+            
+            // Scrum/Agile specific data
+            if (data.storyPoints || data.points || data.estimate || data.size) {
+              const storyPoints = data.storyPoints || data.points || data.estimate || data.size;
+              lines.push(`     🎯 **Story Points:** ${storyPoints}`);
+              
+              // Remaining hesaplama
+              const spent = data.spent || 0;
+              const remaining = storyPoints - spent;
+              if (remaining >= 0) {
+                lines.push(`     ⏳ **Remaining:** ${remaining} (${storyPoints} - ${spent})`);
+              }
+            }
+            
+            if (data.spent || data.remaining) {
+              lines.push(`     ⏱️ **Spent:** ${data.spent || 0}`);
+            }
+            
+            if (data.epic || data.sprint) {
+              lines.push(`     📋 **Epic:** ${data.epic || 'N/A'}`);
+              lines.push(`     🏃 **Sprint:** ${data.sprint || 'N/A'}`);
+            }
+            
+            // Epic ve Sprint için daha geniş arama
+            const epicKeys = ['epic', 'epicName', 'epicId', 'epicTitle'];
+            const sprintKeys = ['sprint', 'sprintName', 'sprintId', 'sprintTitle', 'iteration'];
+            
+            for (const key of epicKeys) {
+              if (data[key] && !data.epic) {
+                lines.push(`     📋 **Epic:** ${data[key]}`);
+                break;
+              }
+            }
+            
+            for (const key of sprintKeys) {
+              if (data[key] && !data.sprint) {
+                lines.push(`     🏃 **Sprint:** ${data[key]}`);
+                break;
+              }
+            }
+            
+            // Diğer plugin verileri
+            if (Object.keys(data).length > 0) {
+              for (const [key, value] of Object.entries(data)) {
+                if (!['storyPoints', 'points', 'estimate', 'size', 'spent', 'remaining', 'epic', 'sprint', 'epicName', 'epicId', 'epicTitle', 'sprintName', 'sprintId', 'sprintTitle', 'iteration'].includes(key)) {
+                  lines.push(`     • ${key}: ${value}`);
+                }
+              }
+            }
+          } catch (e) {
+            // Plugin data parse edilemezse raw data'yı göster
+            lines.push(`     • ${plugin.idPlugin}: ${plugin.value.substring(0, 100)}...`);
+          }
+        }
+      } else {
+        lines.push(`   🔌 **Plugin Data:** Mevcut değil`);
+      }
+
+      // Actions'dan Power-Up verilerini ara
+      if (cardData.actions && cardData.actions.length > 0) {
+        lines.push(`   📝 **Actions:** ${cardData.actions.length} adet`);
+        
+        // Son Power-Up action'larını bul
+        const powerUpActions = cardData.actions.filter((action: any) => 
+          action.type === 'updateCard' && 
+          action.data && 
+          (action.data.old || action.data.card)
+        );
+        
+        if (powerUpActions.length > 0) {
+          lines.push(`   🔄 **Power-Up Actions:** ${powerUpActions.length} adet`);
+          
+          for (const action of powerUpActions.slice(0, 5)) { // Son 5 action
+            if (action.data && action.data.old) {
+              lines.push(`     • ${action.type}: ${JSON.stringify(action.data.old).substring(0, 50)}...`);
+            }
+          }
+        }
+      } else {
+        lines.push(`   📝 **Actions:** Mevcut değil`);
+      }
+      
+      return this.success(lines.join('\n'));
+
+    } catch (error) {
+      let errorMessage = 'Bilinmeyen hata';
+      
+      if (error instanceof Error) {
+        errorMessage = error.message;
+      } else if (typeof error === 'string') {
+        errorMessage = error;
+      } else if (error && typeof error === 'object') {
+        errorMessage = JSON.stringify(error);
+      }
+      
+      return this.error(`Kart bilgileri alınırken hata oluştu: ${errorMessage}`);
+    }
+  }
+}
+
+export class GetListCardsWithPowerUpsTool extends BaseTool {
+  readonly name = 'get_list_cards_with_powerups';
+  readonly description = 'Listedeki tüm kartları Power-Up verileriyle birlikte getir (optimize edilmiş)';
+  readonly inputSchema = {
+    type: 'object',
+    properties: {
+      listId: {
+        type: 'string',
+        description: 'Liste ID\'si',
+      },
+      includeArchived: {
+        type: 'boolean',
+        description: 'Arşivlenmiş kartları da dahil et (varsayılan: false)',
+        default: false,
+      },
+      includePowerUps: {
+        type: 'boolean',
+        description: 'Power-Up verilerini dahil et (varsayılan: true)',
+        default: true,
+      },
+      limit: {
+        type: 'number',
+        description: 'Maksimum kart sayısı (varsayılan: 20)',
+        default: 20,
+      },
+      fields: {
+        type: 'string',
+        description: 'Hangi kart field\'larını getireceği (all, name,desc,due,labels vb.)',
+        default: 'all',
+      },
+    },
+    required: ['listId'],
+  };
+
+  async execute(args: any): Promise<ToolResult> {
+    try {
+      this.validateRequired(args, ['listId']);
+
+      // 1. Optimize edilmiş şekilde kartları getir
+      const cards = await trelloClient.getListCardsOptimized(args.listId, {
+        fields: args.fields || 'all',
+        includeCustomFields: args.includePowerUps,
+        includePluginData: args.includePowerUps,
+        includeMembers: true,
+        includeLabels: true,
+      });
+      
+      let filteredCards = cards;
+
+      // Filter by archived status
+      if (!args.includeArchived) {
+        filteredCards = filteredCards.filter(card => !card.closed);
+      }
+
+      // Apply limit
+      const limit = args.limit || 20;
+      const hasMore = filteredCards.length > limit;
+      filteredCards = filteredCards.slice(0, limit);
+
+      if (filteredCards.length === 0) {
+        return this.success('Bu listede hiç kart bulunamadı.');
+      }
+
+      // 2. Board'daki custom field tanımlarını bir kez getir
+      let boardCustomFields: any[] = [];
+      if (args.includePowerUps && filteredCards.length > 0) {
+        try {
+          const boardId = filteredCards[0].idBoard;
+          boardCustomFields = await trelloClient.getBoardCustomFields(boardId);
+        } catch (error) {
+          // Hata varsa devam et, sadece custom field tanımları olmayacak
+        }
+      }
+
+      const lines = [`📋 **Liste Kartları** (${filteredCards.length} adet${hasMore ? `, ${limit} tanesi gösteriliyor` : ''})`];
+      lines.push('');
+
+      // 3. Kartları formatla
+      for (let i = 0; i < filteredCards.length; i++) {
+        const card = filteredCards[i];
+        
+        lines.push(`**${i + 1}. 🎯 ${card.name}** (ID: ${card.id})`);
+        
+        // Temel kart bilgileri
+        if (card.desc && card.desc.trim()) {
+          lines.push(`   📝 ${this.truncateText(card.desc, 80)}`);
+        }
+        
+        if (card.due) {
+          const isOverdue = new Date(card.due) < new Date();
+          const dueIcon = card.dueComplete ? '✅' : (isOverdue ? '🔴' : '⏰');
+          lines.push(`   ${dueIcon} Son tarih: ${this.formatDate(card.due)}`);
+        }
+        
+        if (card.labels && card.labels.length > 0) {
+          const labelNames = card.labels.map(label => label.name || label.color).join(', ');
+          lines.push(`   🏷️ Etiketler: ${labelNames}`);
+        }
+        
+        if (card.members && card.members.length > 0) {
+          const memberNames = card.members.map(member => member.fullName || member.username).join(', ');
+          lines.push(`   👥 Üyeler: ${memberNames}`);
+        }
+        
+        if (card.badges?.attachments > 0) {
+          lines.push(`   📎 ${card.badges.attachments} ek dosya`);
+        }
+        
+        if (card.badges?.comments > 0) {
+          lines.push(`   💬 ${card.badges.comments} yorum`);
+        }
+        
+        if (card.badges?.checkItems > 0) {
+          lines.push(`   ☑️ ${card.badges.checkItemsChecked}/${card.badges.checkItems} görev tamamlandı`);
+        }
+        
+        if (card.closed) {
+          lines.push(`   🗄️ Arşivlenmiş`);
+        }
+
+        // Power-Up verilerini işle
+        if (args.includePowerUps) {
+          const powerUpData = this.processPowerUpData(card, boardCustomFields);
+          if (powerUpData.length > 0) {
+            lines.push(`   🔌 **Power-Up Verileri:**`);
+            lines.push(...powerUpData.map(data => `     ${data}`));
+          } else {
+            lines.push(`   🔌 **Power-Up Verileri:** Mevcut değil`);
+          }
+        }
+        
+        lines.push(''); // Kartlar arası boşluk
+      }
+
+      return this.success(lines.join('\n'));
+
+    } catch (error) {
+      return this.error(`Kartlar alınırken hata oluştu: ${error instanceof Error ? error.message : 'Bilinmeyen hata'}`);
+    }
+  }
+}
+
+// Export all card tools
+export const cardTools = [
+  new GetListCardsTool(),
+  new GetCardTool(),
+  new CreateCardTool(),
+  new UpdateCardTool(),
+  new MoveCardTool(),
+  new DeleteCardTool(),
+  new ArchiveCardTool(),
+  new GetCardWithPowerUpsTool(),
+  new GetCardDetailedTool(),
+  new GetCardWithScrumDataTool(),
+  new GetListCardsWithPowerUpsTool(),
+];
