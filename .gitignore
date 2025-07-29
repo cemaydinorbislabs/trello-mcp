@@ -3,6 +3,7 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+package-lock.json
 
 # Build outputs
 dist/
@@ -91,3 +92,19 @@ Thumbs.db
 
 # Test files
 test-results/
+
+# MCP specific
+.mcp/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Backup files
+*.backup
+*.bak
+*.old
+
+# Local configuration overrides
+.env.*.local

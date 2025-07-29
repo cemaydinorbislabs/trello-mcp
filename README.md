@@ -2,7 +2,8 @@
 
 Trello için Model Context Protocol (MCP) server. Claude AI ve diğer MCP-uyumlu AI sistemleri ile Trello'yu entegre edin.
 
-**Developed by [OrbisLabs.ai](https://orbislabs.ai)**
+**Developer:** Cem Aydın  
+**Company:** [OrbisLabs.ai](https://orbislabs.ai)
 
 ## 🚀 Özellikler
 
@@ -13,6 +14,28 @@ Trello için Model Context Protocol (MCP) server. Claude AI ve diğer MCP-uyumlu
 - **Bulk Operations**: Çoklu kart işlemleri
 
 ## 🤖 Claude'a Ekleme
+
+### 0. Gerekli Programlar
+TrelloMCP'nin çalışması için bilgisayarınızda aşağıdaki programların yüklü olması gerekiyor:
+
+#### Windows için:
+- **Node.js** (v18 veya üzeri): https://nodejs.org/
+- **Git** (opsiyonel): https://git-scm.com/
+- **Claude Desktop**: https://claude.ai/download
+
+#### macOS için:
+- **Node.js** (v18 veya üzeri): `brew install node` veya https://nodejs.org/
+- **Git** (opsiyonel): `brew install git` veya https://git-scm.com/
+- **Claude Desktop**: https://claude.ai/download
+
+#### Linux için:
+- **Node.js** (v18 veya üzeri): 
+  ```bash
+  curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+  sudo apt-get install -y nodejs
+  ```
+- **Git** (opsiyonel): `sudo apt-get install git`
+- **Claude Desktop**: https://claude.ai/download
 
 ### 1. Kurulum
 ```bash
@@ -30,6 +53,14 @@ https://trello.com/1/authorize?expiration=never&scope=read,write,account&respons
 ```
 
 ### 3. Claude Desktop Konfigürasyonu
+
+#### Claude Desktop'ta MCP Server Ekleme:
+1. **Claude Desktop'ı açın**
+2. **Settings** (⚙️) menüsüne gidin
+3. **MCP Servers** sekmesini seçin
+4. **Add Server** butonuna tıklayın
+5. Aşağıdaki konfigürasyonu yapıştırın:
+
 ```json
 {
   "trello-mcp": {
@@ -47,8 +78,24 @@ https://trello.com/1/authorize?expiration=never&scope=read,write,account&respons
 }
 ```
 
-### 4. Test
-Claude'a şu komutu verin:
+**Not:** `/path/to/your/TrelloMCP` kısmını kendi proje dizininizle değiştirin.
+
+### 4. Kurulum Kontrolü
+Kurulumun başarılı olup olmadığını kontrol etmek için:
+
+```bash
+# Node.js versiyonunu kontrol et
+node --version
+
+# npm versiyonunu kontrol et
+npm --version
+
+# Projeyi test et
+npm run test:trello
+```
+
+### 5. Test
+Claude Desktop'ta TrelloMCP'yi test etmek için şu komutu verin:
 ```
 Trello panolarımı listele
 ```
@@ -195,6 +242,7 @@ MIT License
 
 ---
 
-**Developed with ❤️ by [OrbisLabs.ai](https://orbislabs.ai)**
+**Developer:** Cem Aydın  
+**Company:** [OrbisLabs.ai](https://orbislabs.ai)
 
 *Empowering AI-driven productivity solutions*
